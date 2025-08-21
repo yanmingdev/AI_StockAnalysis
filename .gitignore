@@ -1,0 +1,51 @@
+# --- 專案機密與本機設定 ---
+.env
+*.env
+secrets.*
+*.key
+*.pem
+
+# --- Python/虛擬環境 ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.Python
+pythonenv*
+pip-wheel-metadata/
+env/
+venv/
+ENV/
+.venv/
+
+# --- Jupyter / 臨時檔 ---
+.ipynb_checkpoints/
+*.sqlite3
+*.db
+*.log
+
+# --- 系統/IDE ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.code-workspace
+
+# --- 打包/建置 ---
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# --- 測試 ---
+.coverage
+htmlcov/
+.pytest_cache/
+.tox/
+.mypy_cache/
+
+# --- 其他 ---
+*.bak
+*.tmp
+*.swp
