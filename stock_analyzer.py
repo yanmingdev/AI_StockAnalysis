@@ -1,25 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-AI 市場情報分析助理（雲端友善版）
-- 固定 gemini-1.5-flash
-- 自動抓 Yahoo Finance 新聞 + Gemini 情緒標註（失敗會回退）
-- K 線 + SMA20/60 + 支撐/壓力 + 量能
-- KPI 第一排：最新收盤｜近N根漲跌幅｜支撐區｜壓力區
-- KPI 第二排：RSI14｜量能是否放大｜量能基準(近30日均量)｜今日量能
-- KD 與 MACD 指標與圖形
-- 情緒圓餅圖、新聞列表、最終報告與下載
-
-※ 只新增：
-1) st.session_state.last_params 記住最後一次分析參數
-2) 把主流程包成 run_analysis(params)
-3) 下載造成的 rerun 時，用 last_params 自動重畫
-
-需要 .env：GEMINI_API_KEY=你的金鑰
+AI 市場情報分析助理（台股版｜含模糊搜尋）
+- 市場固定台股，輸入股票「名稱或代碼」即可模糊搜尋（Yahoo Finance Search API）
+- 只列出台股 .TW / .TWO，選擇後自動填入正確代碼
+- 標題顯示：公司中文名（代號）
+- 其餘功能：K線、SMA20/60、支撐/壓力、量能、KD/MACD、新聞情緒與報告、下載不閃畫面
 """
 
 import os, re, io, json, datetime as dt
 from pathlib import Path
 
+import requests
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -38,6 +29,7 @@ from ta.trend import SMAIndicator, MACD
 from ta.momentum import RSIIndicator, StochasticOscillator
 from ta.volatility import BollingerBands
 
+
 # ====== 常數 ======
 NEWS_ITEM_MAX_CHARS = 1200
 CACHE_TTL_SEC = 900
@@ -45,8 +37,9 @@ GEMINI_MODEL = "gemini-1.5-flash"
 VOLUME_LOOKBACK = 30              # 量能基準視窗
 VOL_SPIKE_MULTIPLIER = 1.5        # 視為放量的倍率
 
+
 # ====== 版面 ======
-st.set_page_config(page_title="AI 市場情報分析助理", page_icon="📊", layout="wide")
+st.set_page_config(page_title="AI 市場情報分析助理（台股）", page_icon="📊", layout="wide")
 st.markdown("""
 <style>
 section[data-testid="stSidebar"] { width: 300px !important; }
@@ -61,8 +54,9 @@ section[data-testid="stSidebar"] { width: 300px !important; }
 h2 { margin-top: 1.1rem; }
 </style>
 """, unsafe_allow_html=True)
-st.markdown('<div class="header-title">Code Gym | AI 市場情報分析助理</div>', unsafe_allow_html=True)
+st.markdown('<div class="header-title">AI Stock Analyzer | AI 市場情報分析助理（台股）</div>', unsafe_allow_html=True)
 st.markdown('<div class="header-sub">資訊整合 ｜ 自動分析 ｜ 決策輔助（不提供投資建議）</div>', unsafe_allow_html=True)
+
 
 # ====== ENV / Gemini ======
 load_dotenv()
@@ -83,14 +77,104 @@ def get_gemini_client(api_key: str):
 
 client = get_gemini_client(API_KEY)
 
-# ====== Session: 記住最後一次產生分析的參數（用來對抗下載時的 rerun） ======
+
+# ====== Session：記住最後一次分析參數，避免下載造成畫面消失 ======
 if "last_params" not in st.session_state:
     st.session_state.last_params = None
 
-# ====== Sidebar ======
+if "last_display_name" not in st.session_state:
+    st.session_state.last_display_name = ""
+
+
+# ====== Yahoo Finance 搜尋（台股 .TW/.TWO） ======
+@st.cache_data(ttl=3600, show_spinner=False)
+def yahoo_search_tw(query: str, max_items: int = 20) -> list[dict]:
+    """以 Yahoo Finance Search API 模糊搜尋，僅回傳台股 .TW / .TWO"""
+    if not query or len(query.strip()) < 1:
+        return []
+
+    url = "https://query1.finance.yahoo.com/v1/finance/search"
+    params = {
+        "q": query.strip(),
+        "lang": "zh-TW",
+        "region": "TW",
+    }
+    try:
+        r = requests.get(url, params=params, timeout=7)
+        r.raise_for_status()
+        data = r.json() or {}
+    except Exception:
+        return []
+
+    out = []
+    for it in (data.get("quotes") or []):
+        sym = (it.get("symbol") or "").strip()
+        name = it.get("shortname") or it.get("longname") or it.get("name") or ""
+        if sym.endswith(".TW") or sym.endswith(".TWO"):
+            out.append({"symbol": sym, "name": name})
+    # 去重 & 最多 max_items
+    seen = set()
+    uniq = []
+    for x in out:
+        if x["symbol"] not in seen:
+            uniq.append(x)
+            seen.add(x["symbol"])
+    return uniq[:max_items]
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_name_by_symbol(symbol: str) -> str:
+    """補充：若只有代號，嘗試用 Yahoo 搜尋把名稱抓出來。"""
+    if not symbol:
+        return ""
+    # 用代號反查
+    res = yahoo_search_tw(symbol, 5)
+    for it in res:
+        if it["symbol"].upper() == symbol.upper():
+            return it["name"] or ""
+    # 退而求其次：用 yfinance.info（較慢，且有機率為空）
+    try:
+        info = yf.Ticker(symbol).info or {}
+        return info.get("longName") or info.get("shortName") or ""
+    except Exception:
+        return ""
+
+
+# ====== Sidebar（台股專用）======
 with st.sidebar:
     st.markdown("**基本設定**")
-    symbol = st.text_input("股票代碼（例：2330.TW / AAPL）", value="2330.TW")
+    st.caption("市場固定：台股（.TW / .TWO）")
+
+    # 1) 文字輸入：股票名稱 或 代碼（模糊）
+    query = st.text_input("輸入名稱或代碼（支援模糊）", value="2330")
+
+    # 2) 動態搜尋（即時）
+    found = yahoo_search_tw(query, max_items=20) if query else []
+
+    # 如果直接輸入 4 碼數字，預設補 .TW 作為候選
+    if re.fullmatch(r"\d{4}", str(query).strip()):
+        default_sym = f"{query.strip()}.TW"
+        # 若搜尋結果裡沒有，插到最前面
+        if not any(it["symbol"].upper() == default_sym.upper() for it in found):
+            found.insert(0, {"symbol": default_sym, "name": ""})
+
+    options = [f'{it["symbol"]} — {it["name"]}' if it["name"] else it["symbol"] for it in found] or ["（無結果，請輸入其他關鍵字）"]
+    sel = st.selectbox("搜尋結果", options, index=0)
+
+    # 解析使用者選到的 symbol
+    if found:
+        sel_idx = options.index(sel)
+        symbol = found[sel_idx]["symbol"]
+        display_name = found[sel_idx]["name"] or ""
+    else:
+        # 沒有找到，仍嘗試把輸入轉成 symbol
+        symbol = f"{query.strip()}.TW" if re.fullmatch(r"\d{4}", str(query).strip()) else "2330.TW"
+        display_name = ""
+
+    # 若名稱空的話，補抓名稱
+    if not display_name:
+        display_name = get_name_by_symbol(symbol)
+
     period = st.selectbox("資料期間", ["3mo", "6mo", "1y", "2y"], index=2)
     interval = st.selectbox("K 線週期", ["1d", "1wk"], index=0)
     lookback = st.slider("技術面觀察視窗（近 N 根）", 20, 120, 30, 5)
@@ -107,6 +191,7 @@ with st.sidebar:
     st.markdown("---")
     disclaimer = st.checkbox("我了解本工具僅供教育用途，非投資建議。", value=True)
     run_btn = st.button("產生分析", use_container_width=True)
+
 
 # ====== 工具函式 ======
 def _s(obj, default=""):
@@ -414,9 +499,11 @@ def make_report_download(name: str, text: str):
     bio = io.BytesIO(text.encode("utf-8"))
     st.download_button("⬇️ 下載 Markdown 報告", data=bio, file_name=name, mime="text/markdown")
 
-# ====== 主流程包成函式：下載 rerun 時用相同參數重畫 ======
+
+# ====== 主流程（包成函式，下載 rerun 時用相同參數重畫） ======
 def run_analysis(params: dict):
     symbol       = params["symbol"]
+    display_name = params.get("display_name") or get_name_by_symbol(symbol)
     period       = params["period"]
     interval     = params["interval"]
     lookback     = params["lookback"]
@@ -428,6 +515,12 @@ def run_analysis(params: dict):
     if not disclaimer:
         st.warning("請勾選『僅供教育用途』後再執行。")
         st.stop()
+
+    # 大標題：公司名（代號）
+    if display_name:
+        st.markdown(f"### {display_name}（ {symbol} ）")
+    else:
+        st.markdown(f"### （ {symbol} ）")
 
     # 1) 價格與指標
     data = fetch_ohlcv(symbol, period, interval)
@@ -540,11 +633,12 @@ def run_analysis(params: dict):
 
     st.caption("※ 本工具為教育用途的分析輔助，僅依你提供的資料與指標摘要生成，不構成投資建議。")
 
-# ====== 事件處理 ======
-# 1) 使用者按下「產生分析」=> 記住參數並立即渲染
+
+# ====== 事件處理：按下產生｜或下載後 rerun ======
 if run_btn:
     st.session_state.last_params = {
         "symbol": symbol,
+        "display_name": display_name,
         "period": period,
         "interval": interval,
         "lookback": lookback,
@@ -555,6 +649,6 @@ if run_btn:
     }
     run_analysis(st.session_state.last_params)
 
-# 2) 沒有按鈕、但有「上一次的參數」（例如剛按下載導致 rerun）
 elif st.session_state.last_params:
+    # 使用上一次參數自動重畫（避免按下載後畫面消失）
     run_analysis(st.session_state.last_params)
