@@ -1,6 +1,11 @@
 # -*- coding: utf-8 -*-
+"""
+AI Stock Analyzer | 台股 （精簡版：移除頁籤／交易分頁、新聞固定開啟、移除市場情緒總結顯示）
+"""
 import os, re, io, json, datetime as dt
 from pathlib import Path
+from urllib.parse import quote_plus
+import xml.etree.ElementTree as ET
 
 import requests
 import streamlit as st
@@ -16,44 +21,52 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 
-# ta 指標
+# 技術指標
 from ta.trend import SMAIndicator, MACD
 from ta.momentum import RSIIndicator, StochasticOscillator
 from ta.volatility import BollingerBands
 
-# ====== 常數 ======
+# ====== 常數（精簡 UI 版本的固定參數）======
 NEWS_ITEM_MAX_CHARS = 1200
 CACHE_TTL_SEC = 900
 GEMINI_MODEL = "gemini-1.5-flash"
 VOLUME_LOOKBACK = 30
 VOL_SPIKE_MULTIPLIER = 1.5
 
-# ====== 版面 ======
+# 固定圖資期間與技術視窗
+DEFAULT_PERIOD = "1y"
+DEFAULT_INTERVAL = "1d"
+DEFAULT_LOOKBACK = 30  # 近 N 根
+
+# 固定 AI 溫度（較詳細、較一致）
+FIXED_TEMPERATURE = 0.2
+
+# ====== 版面與樣式 ======
 st.set_page_config(page_title="AI 市場情報分析助理（台股）", page_icon="📊", layout="wide")
 
-# 置頂導覽（頁內錨點 + 其他分頁）
 st.markdown("""
 <style>
+/* 固定側欄寬度 */
 section[data-testid="stSidebar"] { width: 300px !important; }
 
-/* 置頂導覽條 */
-.topbar {
-  position: sticky; top: 0; z-index: 999;
-  backdrop-filter: blur(6px);
-  background: rgba(16,16,20,.78);
-  border-bottom: 1px solid rgba(255,255,255,.08);
-  margin: -1rem -1rem 12px -1rem; padding: 10px 16px;
-}
+/* 隱藏 Streamlit 預設的多頁導覽（會顯示 stock analyzer / trading） */
+div[data-testid="stSidebarNav"] { display: none !important; }
+
+/* Topbar */
+.topbar { position: sticky; top: 0; z-index: 999; backdrop-filter: blur(6px);
+  background: rgba(16,16,20,.78); border-bottom: 1px solid rgba(255,255,255,.08);
+  margin: -1rem -1rem 12px -1rem; padding: 10px 16px; }
 .topbar .wrap { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
-.topbar a {
-  text-decoration: none; font-weight: 600; font-size: 14px;
-  padding: 6px 10px; border-radius: 8px; border: 1px solid rgba(255,255,255,.08);
-}
+.topbar a { text-decoration: none; font-weight: 600; font-size: 14px; padding: 6px 10px;
+  border-radius: 8px; border: 1px solid rgba(255,255,255,.08); }
 .topbar a:hover { background: rgba(255,255,255,.06); }
 .topbar .spacer { flex: 1; }
+
 .header-title { font-size:26px; font-weight:800; margin: 6px 0 4px 0; }
 .header-sub   { color:#aaa; margin: 0 0 12px 0; }
-.card { border:1px solid #2b2f36; border-radius:12px; padding:14px; margin:10px 0; background:#111; box-shadow: 0 1px 2px rgba(0,0,0,.08); }
+
+.card { border:1px solid #2b2f36; border-radius:12px; padding:14px; margin:10px 0;
+  background:#111; box-shadow: 0 1px 2px rgba(0,0,0,.08); }
 .badge { display:inline-block; padding:2px 8px; border-radius:999px; font-size:12px; margin-right:6px; }
 .badge-green{ background:#0f5132; color:#b6ffce;}
 .badge-red  { background:#5c1b1b; color:#ffc4c4;}
@@ -67,10 +80,9 @@ section[data-testid="stSidebar"] { width: 300px !important; }
     <a href="#sec-chart">股價圖</a>
     <a href="#sec-tech">技術指標</a>
     <a href="#sec-news">情報新聞</a>
-    <a href="#sec-summary">市場情緒總結</a>
+    <!-- 已移除「市場情緒總結」與「交易紀錄／報酬」連結 -->
     <a href="#sec-ai">AI 分析結果</a>
     <span class="spacer"></span>
-    <a href="/02_trading">🧾 交易紀錄／報酬</a>
   </div>
 </div>
 """, unsafe_allow_html=True)
@@ -94,11 +106,34 @@ client = get_gemini_client(API_KEY)
 if "last_params" not in st.session_state:
     st.session_state.last_params = None
 
-# ====== 工具 ======
+# ====== 小工具 ======
 def _s(obj, default=""): return str(obj) if obj is not None else default
-def _epoch_to_str(sec: int):
-    try: return dt.datetime.utcfromtimestamp(int(sec)).strftime("%Y-%m-%d %H:%M:%S UTC")
-    except Exception: return ""
+
+def _epoch_to_local_str(sec: int) -> str:
+    """epoch -> 本機時區 YYYY/MM/DD HH:MM"""
+    try:
+        return dt.datetime.fromtimestamp(int(sec)).strftime("%Y/%m/%d %H:%M")
+    except Exception:
+        return ""
+
+def _fmt_dt_str(s: str) -> str:
+    """RFC822/常見字串 -> 本機時區 YYYY/MM/DD HH:MM；失敗回空字串"""
+    if not s:
+        return ""
+    for fmt in [
+        "%a, %d %b %Y %H:%M:%S %Z",
+        "%a, %d %b %Y %H:%M:%S %z",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y/%m/%d %H:%M",
+    ]:
+        try:
+            d = dt.datetime.strptime(s.strip(), fmt)
+            if d.tzinfo:
+                return d.astimezone().strftime("%Y/%m/%d %H:%M")
+            return d.strftime("%Y/%m/%d %H:%M")
+        except Exception:
+            continue
+    return ""
 
 def to_text(x) -> str:
     if x is None: return ""
@@ -124,12 +159,23 @@ def get_series(df: pd.DataFrame, col: str) -> pd.Series:
     if isinstance(s, pd.DataFrame): s = s.iloc[:, 0]
     return pd.to_numeric(s.squeeze(), errors="coerce")
 
+# ====== 取價 / 搜尋（強化） ======
 @st.cache_data(show_spinner=False, ttl=CACHE_TTL_SEC)
 def fetch_ohlcv(sym: str, per: str, itv: str) -> pd.DataFrame:
     return yf.download(sym, period=per, interval=itv, auto_adjust=False, progress=False)
 
+@st.cache_data(ttl=600, show_spinner=False)
+def _verify_symbol_has_data(symbol: str) -> bool:
+    """用短期資料驗證代號是否存在（股票/ETF/權證皆可）。"""
+    try:
+        df = yf.download(symbol, period="5d", interval="1d", progress=False)
+        return not df.empty
+    except Exception:
+        return False
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def yahoo_search_tw(query: str, max_items: int = 20) -> list[dict]:
+    """Yahoo API 模糊搜尋（公司名/代號），只回傳 .TW/.TWO。"""
     if not query or len(query.strip()) < 1: return []
     url = "https://query1.finance.yahoo.com/v1/finance/search"
     params = {"q": query.strip(), "lang": "zh-TW", "region": "TW"}
@@ -143,25 +189,52 @@ def yahoo_search_tw(query: str, max_items: int = 20) -> list[dict]:
         name = it.get("shortname") or it.get("longname") or it.get("name") or ""
         if sym.endswith(".TW") or sym.endswith(".TWO"):
             out.append({"symbol": sym, "name": name})
+    # 去重
     uniq, seen = [], set()
     for x in out:
         if x["symbol"] not in seen:
             uniq.append(x); seen.add(x["symbol"])
     return uniq[:max_items]
 
+@st.cache_data(ttl=1800, show_spinner=False)
+def _resolve_numeric_code_candidates(code: str) -> list[dict]:
+    """
+    純數字（4~6 碼）→ 依序嘗試 .TW / .TWO，驗證有價量就收錄，適用股票 / ETF / 權證。
+    例：1815 → 1815.TW 或 1815.TWO；0050 → 0050.TW（ETF）。
+    """
+    code = code.strip()
+    if not re.fullmatch(r"\d{4,6}", code):
+        return []
+    candidates = []
+    for mkt in (".TW", ".TWO"):
+        sym = f"{code}{mkt}"
+        if _verify_symbol_has_data(sym):
+            # 取名稱（失敗就空字串，不影響顯示）
+            try:
+                info = yf.Ticker(sym).info or {}
+                nm = info.get("longName") or info.get("shortName") or ""
+            except Exception:
+                nm = ""
+            candidates.append({"symbol": sym, "name": nm})
+    return candidates
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_name_by_symbol(symbol: str) -> str:
+    """優先用 Yahoo 搜尋結果名稱；否則回退 yfinance 的 info 名稱；再不行就空字串。"""
     if not symbol: return ""
+    try:
+        info = yf.Ticker(symbol).info or {}
+        nm = info.get("longName") or info.get("shortName") or ""
+        if nm: return nm
+    except Exception:
+        pass
     res = yahoo_search_tw(symbol, 5)
     for it in res:
         if it["symbol"].upper() == symbol.upper():
             return it["name"] or ""
-    try:
-        info = yf.Ticker(symbol).info or {}
-        return info.get("longName") or info.get("shortName") or ""
-    except Exception:
-        return ""
+    return ""
 
+# ====== 指標計算 ======
 def compute_indicators(raw: pd.DataFrame) -> pd.DataFrame:
     df = raw.copy()
     open_s  = get_series(df, "Open")
@@ -173,18 +246,23 @@ def compute_indicators(raw: pd.DataFrame) -> pd.DataFrame:
         "Open": open_s.values, "High": high_s.values, "Low": low_s.values,
         "Close": close_s.values, "Volume": vol_s.values
     }, index=raw.index)
+
     df["SMA20"] = SMAIndicator(close=close_s, window=20, fillna=False).sma_indicator()
     df["SMA60"] = SMAIndicator(close=close_s, window=60, fillna=False).sma_indicator()
+
     macd = MACD(close=close_s, window_slow=26, window_fast=12, window_sign=9, fillna=False)
     df["MACD"], df["MACD_signal"], df["MACD_hist"] = macd.macd(), macd.macd_signal(), macd.macd_diff()
+
     df["RSI14"] = RSIIndicator(close=close_s, window=14, fillna=False).rsi()
+
     bb = BollingerBands(close=close_s, window=20, window_dev=2, fillna=False)
     df["BB_low"], df["BB_mid"], df["BB_high"] = bb.bollinger_lband(), bb.bollinger_mavg(), bb.bollinger_hband()
+
     stoch = StochasticOscillator(high=high_s, low=low_s, close=close_s, window=9, smooth_window=3, fillna=False)
     df["KD_K"], df["KD_D"] = stoch.stoch(), stoch.stoch_signal()
     return df
 
-# === 預測工具 ===
+# ===== 簡易預測（保留） =====
 def compute_atr(df: pd.DataFrame, window: int = 14) -> float:
     high, low, close = df["High"], df["Low"], df["Close"]
     prev_close = close.shift(1)
@@ -224,7 +302,6 @@ def forecast_ohlc(df: pd.DataFrame, steps: int, interval: str = "1d"):
         delta = med - o
         hi = max(o, med) + 0.6 * atr + max(delta, 0) * 0.25
         lo = min(o, med) - 0.6 * atr + min(delta, 0) * 0.25
-
         opens.append(o); highs.append(hi); lows.append(lo); closes_med.append(med)
         p10_list.append(p10); p90_list.append(p90)
         prev_close = med
@@ -234,29 +311,29 @@ def forecast_ohlc(df: pd.DataFrame, steps: int, interval: str = "1d"):
     med = pd.Series(closes_med, index=fdf.index); p10 = pd.Series(p10_list, index=fdf.index); p90 = pd.Series(p90_list, index=fdf.index)
     return fdf, med, p10, p90
 
-def add_forecast_traces(fig: go.Figure, fdf: pd.DataFrame, med: pd.Series, p10: pd.Series, p90: pd.Series, hist_last_index):
-    if fdf.empty: return
-    purple = "#A855F7"
-    # 預測區直條背景
-    fig.add_vrect(x0=hist_last_index, x1=fdf.index[-1], fillcolor="rgba(168,85,247,0.08)", line_width=0, row=1, col=1)
-    # 預測 K
-    fig.add_trace(go.Candlestick(
-        x=fdf.index, open=fdf["Open"], high=fdf["High"], low=fdf["Low"], close=fdf["Close"], name="預測K",
-        increasing=dict(line=dict(color=purple, width=1.2), fillcolor="rgba(168,85,247,0.45)"),
-        decreasing=dict(line=dict(color=purple, width=1.2), fillcolor="rgba(168,85,247,0.45)"),
-        opacity=0.85, whiskerwidth=0.3
-    ), row=1, col=1)
-    # 10-90% 區間 + 中位線
-    fig.add_trace(go.Scatter(x=med.index, y=p90, name="P90(收盤)", mode="lines",
-                             line=dict(width=1.2, dash="dashdot", color=purple)), row=1, col=1)
-    fig.add_trace(go.Scatter(x=med.index, y=p10, name="P10(收盤)", mode="lines",
-                             line=dict(width=1.2, dash="dot", color=purple),
-                             fill="tonexty", fillcolor="rgba(168,85,247,0.12)"), row=1, col=1)
-    fig.add_trace(go.Scatter(x=med.index, y=med, name="預測收盤(中位)", mode="lines+markers",
-                             line=dict(width=2.2, dash="dash", color=purple),
-                             marker=dict(size=5, symbol="diamond")), row=1, col=1)
+# ====== Fibonacci（正／負 38.2% 與 61.8%，只輸出表格） ======
+def compute_fib_posneg(df: pd.DataFrame, lookback: int) -> pd.DataFrame:
+    """以近 N 根高低的振幅 R，樞紐 P=最新收盤，輸出 ±38.2%、±61.8% 價位。"""
+    tail = df.dropna().tail(lookback)
+    if tail.empty:
+        return pd.DataFrame()
+    high = float(tail["High"].max())
+    low  = float(tail["Low"].min())
+    if not np.isfinite(high) or not np.isfinite(low) or high == low:
+        return pd.DataFrame()
+    rng = high - low
+    P = float(tail["Close"].iloc[-1])
+    levels = [
+        ("-61.8%", round(P - 0.618*rng, 2)),
+        ("-38.2%", round(P - 0.382*rng, 2)),
+        ("+38.2%", round(P + 0.382*rng, 2)),
+        ("+61.8%", round(P + 0.618*rng, 2)),
+    ]
+    df_levels = pd.DataFrame(levels, columns=["層級", "價位"])
+    return df_levels
 
 def summarize_features(df: pd.DataFrame, lookback: int) -> dict:
+    """技術摘要：漲跌幅/均線/RSI/KD/MACD/量能，並以 0.618(下)/0.382(上) 做支撐/壓力提示。"""
     tail = df.dropna().tail(max(lookback, VOLUME_LOOKBACK)).copy()
     last, first = tail.iloc[-1], tail.iloc[0]
     pct_change = round((last["Close"]/first["Close"]-1)*100, 2)
@@ -267,8 +344,11 @@ def summarize_features(df: pd.DataFrame, lookback: int) -> dict:
     vol_tail = tail["Volume"].tail(VOLUME_LOOKBACK)
     vol_mean = float(vol_tail.mean())
     vol_spike = bool(last["Volume"] >= VOL_SPIKE_MULTIPLIER * vol_mean)
-    support = round(float(tail["Low"].min()), 2)
-    resistance = round(float(tail["High"].max()), 2)
+    # 支撐/壓力（retracement 參考）
+    high = float(tail["High"].max()); low = float(tail["Low"].min()); diff = high - low
+    support = round(high - 0.618*diff, 2)
+    resistance = round(high - 0.382*diff, 2)
+
     return {
         "as_of": str(tail.index[-1].date()),
         "period_bars": lookback,
@@ -286,64 +366,7 @@ def summarize_features(df: pd.DataFrame, lookback: int) -> dict:
         "macd_hist": round(float(last.get("MACD_hist", float('nan'))), 4) if pd.notna(last.get("MACD_hist", None)) else None
     }
 
-def make_candlestick_with_volume(df: pd.DataFrame, support: float, resistance: float) -> go.Figure:
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.7, 0.3])
-    # 主 K
-    fig.add_trace(go.Candlestick(x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
-                                 name="K",
-                                 increasing=dict(line=dict(color="#26A69A", width=1.2), fillcolor="rgba(38,166,154,0.6)"),
-                                 decreasing=dict(line=dict(color="#EF5350", width=1.2), fillcolor="rgba(239,83,80,0.6)")),
-                  row=1, col=1)
-    # SMA
-    fig.add_trace(go.Scatter(x=df.index, y=df["SMA20"], name="SMA20", mode="lines",
-                             line=dict(width=2.2, color="#60A5FA")), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=df["SMA60"], name="SMA60", mode="lines",
-                             line=dict(width=2.2, color="#F9A8D4")), row=1, col=1)
-    # 交叉標記
-    s20, s60 = df["SMA20"], df["SMA60"]
-    cross_up_idx = (s20.shift(1) <= s60.shift(1)) & (s20 > s60)
-    cross_dn_idx = (s20.shift(1) >= s60.shift(1)) & (s20 < s60)
-    fig.add_trace(go.Scatter(x=df.index[cross_up_idx], y=df.loc[cross_up_idx, "Close"], mode="markers",
-                             name="黃金交叉", marker_symbol="triangle-up", marker_size=10, marker_color="#22c55e"), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df.index[cross_dn_idx], y=df.loc[cross_dn_idx, "Close"], mode="markers",
-                             name="死亡交叉", marker_symbol="triangle-down", marker_size=10, marker_color="#f97316"), row=1, col=1)
-    # 支撐/壓力
-    def _hline(yval, color):
-        if yval is None or pd.isna(yval): return
-        fig.add_shape(type="line", x0=df.index[0], x1=df.index[-1], y0=yval, y1=yval,
-                      xref="x", yref="y", line=dict(dash="dot", width=1.4, color=color))
-    _hline(support, "#10b981"); _hline(resistance, "#ef4444")
-    # 量
-    fig.add_trace(go.Bar(x=df.index, y=df["Volume"], name="Volume", marker_color="rgba(100,116,139,0.7)"), row=2, col=1)
-    fig.update_layout(
-        template="plotly_dark",
-        xaxis_rangeslider_visible=False,
-        height=620,
-        margin=dict(l=10, r=60, t=36, b=10),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        hovermode="x unified"
-    )
-    return fig
-
-def make_kd_chart(df: pd.DataFrame) -> go.Figure:
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=df.index, y=df["KD_K"], mode="lines", name="%K(9)"))
-    fig.add_trace(go.Scatter(x=df.index, y=df["KD_D"], mode="lines", name="%D(3)"))
-    fig.add_hline(y=80, line_dash="dot"); fig.add_hline(y=20, line_dash="dot")
-    if len(df.index) > 0:
-        fig.add_trace(go.Scatter(x=[df.index[-1]], y=[df["KD_K"].iloc[-1]], mode="markers", name="K_last"))
-        fig.add_trace(go.Scatter(x=[df.index[-1]], y=[df["KD_D"].iloc[-1]], mode="markers", name="D_last"))
-    fig.update_layout(template="plotly_dark", height=320, margin=dict(l=10, r=10, t=10, b=10), legend=dict(orientation="h"))
-    return fig
-
-def make_macd_chart(df: pd.DataFrame) -> go.Figure:
-    fig = go.Figure()
-    fig.add_trace(go.Bar(x=df.index, y=df["MACD_hist"], name="Hist"))
-    fig.add_trace(go.Scatter(x=df.index, y=df["MACD"], mode="lines", name="MACD"))
-    fig.add_trace(go.Scatter(x=df.index, y=df["MACD_signal"], mode="lines", name="Signal"))
-    fig.update_layout(template="plotly_dark", height=320, margin=dict(l=10, r=10, t=10), legend=dict(orientation="h"))
-    return fig
-
+# ===== 文字/新聞／AI 報告 =====
 def load_prompt(path: str, fallback: str) -> str:
     p = Path(path)
     if p.exists():
@@ -364,19 +387,80 @@ def extract_json_block(text: str):
     try: return json.loads(text)
     except Exception: return None
 
+# --- Yahoo Finance 新聞（已修正：切片前轉字串） ---
 @st.cache_data(show_spinner=False, ttl=600)
-def fetch_recent_news(symbol: str, max_items: int):
-    try: raw = yf.Ticker(symbol).news or []
-    except Exception: raw = []
+def fetch_news_yahoo(symbol: str, max_items: int = 3):
+    """
+    從 yfinance 取新聞。yfinance 某些欄位（如 summary/content）可能是 dict/list，
+    在做切片前一律轉成字串避免 KeyError: slice(None, 1200, None)。
+    """
+    try:
+        raw = yf.Ticker(symbol).news or []
+    except Exception:
+        raw = []
+
     items = []
     for n in raw[:max_items]:
-        title = to_text(n.get("title") or "")
-        link  = to_text(n.get("link") or n.get("url") or "")
-        ts    = n.get("providerPublishTime") or n.get("published_on")
-        pub   = _epoch_to_str(ts) if ts else ""
-        desc  = to_text(n.get("summary") or n.get("content") or n.get("publisher") or "").strip()
-        items.append({"title": title, "time": pub, "link": link, "content": desc[:NEWS_ITEM_MAX_CHARS]})
+        # 可能是 str / dict / list / None → 統一轉成字串
+        raw_summary = n.get("summary") if isinstance(n, dict) else ""
+        raw_content = n.get("content") if isinstance(n, dict) else ""
+        text_sum = to_text(raw_summary) or to_text(raw_content) or ""
+        text_sum = text_sum[:NEWS_ITEM_MAX_CHARS]  # 現在一定是字串，安全切片
+
+        items.append({
+            "title": (n.get("title") or "") if isinstance(n, dict) else "",
+            "link": (n.get("link") or n.get("url") or "") if isinstance(n, dict) else "",
+            "publisher": (n.get("publisher") or "Yahoo Finance") if isinstance(n, dict) else "Yahoo Finance",
+            "published_ts": int(n.get("providerPublishTime", 0)) if isinstance(n, dict) and n.get("providerPublishTime") else None,
+            "published_at_fmt": _epoch_to_local_str(n.get("providerPublishTime")) if isinstance(n, dict) and n.get("providerPublishTime") else "",
+            "content": text_sum,
+            "source": "Yahoo"
+        })
     return items
+
+# --- Google News RSS（可指定站台） ---
+def _parse_google_news_rss(query: str, site: str | None, max_items: int = 3):
+    q = quote_plus(query + (f" site:{site}" if site else ""))
+    url = f"https://news.google.com/rss/search?q={q}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
+    try:
+        r = requests.get(url, timeout=8)
+        r.raise_for_status()
+    except Exception:
+        return []
+    try:
+        root = ET.fromstring(r.text)
+    except Exception:
+        return []
+    ns = {}
+    items = []
+    for item in root.findall(".//item", ns)[:max_items]:
+        title = (item.findtext("title") or "").strip()
+        link  = (item.findtext("link") or "").strip()
+        pub   = (item.findtext("pubDate") or "").strip()
+        src   = ""
+        src_el = item.find("{*}source")
+        if src_el is not None and src_el.text:
+            src = src_el.text.strip()
+        items.append({
+            "title": title, "link": link,
+            "publisher": src or (site or "Google News"),
+            "published_ts": None, "published_at_fmt": _fmt_dt_str(pub),
+            "content": "", "source": site or "GoogleNews"
+        })
+    return items
+
+@st.cache_data(show_spinner=False, ttl=600)
+def fetch_news_multi(symbol: str, display_name: str, each: int = 3):
+    """三個網站：Yahoo + GoogleNews(UDN) + GoogleNews(CNYES)，各取 3 則"""
+    q = display_name or symbol
+    lst = []
+    lst += fetch_news_yahoo(symbol, max_items=each)
+    lst += _parse_google_news_rss(q, site="money.udn.com", max_items=each)
+    lst += _parse_google_news_rss(q, site="news.cnyes.com", max_items=each)
+    for it in lst:
+        if not it.get("content"):
+            it["content"] = it.get("title","")
+    return lst[: (each*3)]
 
 def classify_news_with_gemini(symbol: str, news_items: list, temperature: float):
     if not news_items: return []
@@ -394,33 +478,19 @@ def classify_news_with_gemini(symbol: str, news_items: list, temperature: float)
         resp = client.models.generate_content(model=GEMINI_MODEL, contents=[prompt], config=cfg)
         parsed = extract_json_block(resp.text or "")
         if isinstance(parsed, list): return parsed
-    except Exception: pass
+    except Exception:
+        pass
+    # fallback：若 LLM 失敗則以中性填回
     return [{
-        "title": it.get("title",""), "published_at": it.get("time",""), "link": it.get("link",""),
+        "title": it.get("title",""), "published_at": it.get("published_at_fmt",""), "link": it.get("link",""),
         "summary": (it.get("content","") or "")[:200],
         "stock_sentiment": {"label":"Neutral","score":0.5},
         "article_sentiment": {"label":"Neutral","score":0.5},
         "relevance": 0.5
     } for it in (news_items or [])]
 
-def aggregate_sentiment(results: list):
-    if not results:
-        return {"total":0,"bullish":0,"neutral":0,"bearish":0,"bullish_ratio":0.0,"avg_article_score":0.0,"avg_relevance":0.0}
-    label_map = {"Bullish":"bullish","Bearish":"bearish","Neutral":"neutral"}
-    counts = {"bullish":0,"neutral":0,"bearish":0}; s_score = s_rel = 0.0
-    for r in results:
-        lab = r.get("stock_sentiment",{}).get("label","Neutral")
-        counts[label_map.get(lab,"neutral")] += 1
-        s_score += float(r.get("article_sentiment",{}).get("score",0.5) or 0.0)
-        s_rel   += float(r.get("relevance",0.0) or 0.0)
-    total = len(results)
-    return {
-        "total": total, "bullish": counts["bullish"], "neutral": counts["neutral"], "bearish": counts["bearish"],
-        "bullish_ratio": round(counts["bullish"]/total, 3),
-        "avg_article_score": round(s_score/total, 3), "avg_relevance": round(s_rel/total, 3)
-    }
-
-def build_overall_report(symbol: str, features: dict, results: list, agg: dict, temperature: float):
+def build_overall_report(symbol: str, features: dict, results: list, temperature: float):
+    """產生完整 Markdown 報告（含：市場情緒總結 / AI 分析結果）"""
     fallback = (
         "你是嚴謹的投資研究助理。以條列輸出，不要投資建議；"
         "必要時用『若A則B』條件化語句。\n"
@@ -432,8 +502,24 @@ def build_overall_report(symbol: str, features: dict, results: list, agg: dict, 
         "### 條件化情境與價位帶"
     )
     tpl = load_prompt("final_report_prompt.txt", fallback)
+
+    counts = {"Bullish":0,"Neutral":0,"Bearish":0}; rel = 0.0
+    for r in (results or []):
+        lab = r.get("stock_sentiment",{}).get("label","Neutral")
+        counts[lab] = counts.get(lab,0) + 1
+        rel += float(r.get("relevance",0.0) or 0.0)
+    total = len(results); avg_rel = round(rel/total, 3) if total else 0.0
+
     payload = {
-        "symbol": symbol, "features": features, "sentiment_stats": agg,
+        "symbol": symbol,
+        "features": features,
+        "sentiment_stats": {
+            "total": total,
+            "bullish": counts["Bullish"],
+            "neutral": counts["Neutral"],
+            "bearish": counts["Bearish"],
+            "avg_relevance": avg_rel
+        },
         "top_news": [{
             "title": r.get("title",""),
             "sentiment": r.get("stock_sentiment",{}).get("label","Neutral"),
@@ -447,64 +533,88 @@ def build_overall_report(symbol: str, features: dict, results: list, agg: dict, 
         resp = client.models.generate_content(model=GEMINI_MODEL, contents=[prompt], config=cfg)
         return resp.text or ""
     except Exception as e:
-        return f"（AI 報告產生失敗：{e}）"
+        base = (
+            f"## 市場情緒總結\n"
+            f"- 近 {features['period_bars']} 根漲跌幅：{features['pct_change_period']}%\n"
+            f"- 均線：SMA20 與 SMA60 為「{features['ma_trend']}」結構；"
+            f"黃金交叉：{features['golden_cross']}；死亡交叉：{features['dead_cross']}\n"
+            f"- RSI14：{features['rsi14']}（{features['rsi_state']}）；量能是否放大："
+            f"{'是' if features['volume_spike'] else '否'}（近 30 日均量約 {features['volume_mean_period']:,}）\n"
+            f"- 支撐區：{features['support_near']}；壓力區：{features['resistance_near']}\n\n"
+            f"## AI 分析結果\n"
+            f"### 分析總結\n- 資料不足以生成完整 AI 報告（{e}）。\n"
+        )
+        return base
 
-def make_report_download(name: str, text: str):
-    st.download_button("⬇️ 下載 Markdown 報告", data=io.BytesIO(text.encode("utf-8")), file_name=name, mime="text/markdown")
-
-# 將 AI 報告切成「市場情緒總結」與「AI 分析結果」兩段
 def split_ai_report(text: str) -> tuple[str, str]:
+    """把完整 Markdown 拆成『市場情緒總結』與『AI 分析結果』兩段，便於分區顯示。"""
     if not text: return "", ""
-    # 找到「## AI 分析結果」的開頭
     m = re.search(r"^##\s*AI\s*分析結果.*$", text, flags=re.M)
     if not m:
-        return text, ""  # 找不到就全部放第一段
+        return text.strip(), ""
     part1 = text[:m.start()]
     part2 = text[m.start():]
-    # 去掉兩段各自的第一個 H2 標題，避免重複
     part1 = re.sub(r"^##\s*[^\n]+\n?", "", part1.strip(), count=1, flags=re.M)
     part2 = re.sub(r"^##\s*[^\n]+\n?", "", part2.strip(), count=1, flags=re.M)
     return part1.strip(), part2.strip()
 
-# ====== Sidebar（台股專用）======
+def make_report_download(name: str, text: str):
+    st.download_button("⬇️ 下載 Markdown 報告", data=io.BytesIO(text.encode("utf-8")), file_name=name, mime="text/markdown")
+
+# ====== Sidebar：精簡控制（新聞固定開啟） ======
 with st.sidebar:
     st.markdown("**基本設定**")
     st.caption("市場固定：台股（.TW / .TWO）")
     query = st.text_input("輸入名稱或代碼（支援模糊）", value="2330")
 
-    # 搜尋候選
-    found = (lambda q: [] if not q else yahoo_search_tw(q, 20))(query)
-    if re.fullmatch(r"\d{4}", str(query).strip()):
-        default_sym = f"{query.strip()}.TW"
-        if not any(it["symbol"].upper() == default_sym.upper() for it in found):
-            found.insert(0, {"symbol": default_sym, "name": ""})
-    options = [f'{it["symbol"]} — {it["name"]}' if it["name"] else it["symbol"] for it in found] or ["（無結果，請輸入其他關鍵字）"]
+    yahoo_found = yahoo_search_tw(query, 20)
+    numeric_candidates = _resolve_numeric_code_candidates(query)
+
+    direct = []
+    if re.fullmatch(r"\d{1,6}\.(?:TW|TWO)", query.strip().upper()):
+        sym = query.strip().upper()
+        if _verify_symbol_has_data(sym):
+            try:
+                info = yf.Ticker(sym).info or {}
+                nm = info.get("longName") or info.get("shortName") or ""
+            except Exception:
+                nm = ""
+            direct.append({"symbol": sym, "name": nm})
+
+    merged = []
+    seen = set()
+    for seq in (direct, numeric_candidates, yahoo_found):
+        for it in seq:
+            if it["symbol"] not in seen:
+                merged.append(it); seen.add(it["symbol"])
+
+    if not merged and re.fullmatch(r"\d{4}", query.strip()):
+        merged.append({"symbol": f"{query.strip()}.TW", "name": ""})
+
+    options = [f'{it["symbol"]} — {it["name"]}' if it["name"] else it["symbol"] for it in merged] or ["（無結果，請輸入其他關鍵字）"]
     sel = st.selectbox("搜尋結果", options, index=0)
-    if found:
-        sel_idx = options.index(sel); symbol = found[sel_idx]["symbol"]; display_name = found[sel_idx]["name"] or ""
+    if merged:
+        sel_idx = options.index(sel); symbol = merged[sel_idx]["symbol"]; display_name = merged[sel_idx]["name"] or ""
     else:
         symbol, display_name = ("2330.TW", "")
     if not display_name: display_name = get_name_by_symbol(symbol)
 
-    period = st.selectbox("資料期間", ["3mo", "6mo", "1y", "2y"], index=2)
-    interval = st.selectbox("K 線週期", ["1d", "1wk"], index=0)
-    lookback = st.slider("技術面觀察視窗（近 N 根）", 20, 120, 30, 5)
+    period   = DEFAULT_PERIOD
+    interval = DEFAULT_INTERVAL
+    lookback = DEFAULT_LOOKBACK
 
-    # 預測：固定一週（日K=5、週K=1）
     st.markdown("---")
     st.markdown("**實驗功能：價格路徑預測**")
     predict_enabled = st.toggle("顯示未來一週預測", value=True)
     forecast_steps = 5 if interval == "1d" else 1
 
-    # AI 溫度
     st.markdown("---")
-    st.markdown("**AI 設定**")
-    temperature = st.slider("Temperature", 0.0, 1.0, 0.4, 0.1)
+    st.caption(f"AI Temperature 已固定為 {FIXED_TEMPERATURE}（較詳細、較一致）")
 
-    # 新聞：固定抓最新最多 10 則（只保留開關）
     st.markdown("---")
-    auto_news = st.toggle("自動抓取新聞（Yahoo Finance）", value=True)
-    max_news = 10
+    # 新聞固定開啟（移除切換鈕）
+    st.caption("自動抓取新聞：Yahoo + UDN + 鉅亨（已固定啟用）")
+    max_each_site = 3
 
     st.markdown("---")
     disclaimer = st.checkbox("我了解本工具僅供教育用途，非投資建議。", value=True)
@@ -512,50 +622,97 @@ with st.sidebar:
 
 # ====== 主流程 ======
 def run_analysis(params: dict):
-    symbol       = params["symbol"]
-    display_name = params.get("display_name") or get_name_by_symbol(symbol)
-    period       = params["period"]
-    interval     = params["interval"]
-    lookback     = params["lookback"]
-    temperature  = params["temperature"]
-    auto_news    = params["auto_news"]
-    max_news     = params["max_news"]
-    disclaimer   = params["disclaimer"]
+    symbol        = params["symbol"]
+    display_name  = params.get("display_name") or get_name_by_symbol(symbol)
+    period        = params["period"]
+    interval      = params["interval"]
+    lookback      = params["lookback"]
+    temperature   = params["temperature"]
+    max_each_site = params["max_each_site"]
+    disclaimer    = params["disclaimer"]
     predict_enabled = params.get("predict_enabled", False)
     forecast_steps  = int(params.get("forecast_steps", 5))
 
     if not disclaimer:
         st.warning("請勾選『僅供教育用途』後再執行。"); st.stop()
 
-    # 公司抬頭
     st.markdown(f"### {display_name}（ {symbol} ）" if display_name else f"### （ {symbol} ）")
 
-    # 資料與指標
+    # === 資料 & 指標 ===
     data = fetch_ohlcv(symbol, period, interval)
     if data.empty: st.warning("抓不到資料，請確認代碼或期間設定。"); st.stop()
     df = compute_indicators(data)
     feats = summarize_features(df, lookback=lookback)
 
-    # --- 股價趨勢圖 ---
+    # === 一、股價趨勢圖 ===
     st.markdown('<a id="sec-chart"></a>', unsafe_allow_html=True)
     st.markdown("## 一、股價趨勢圖")
-    fig = make_candlestick_with_volume(df, feats["support_near"], feats["resistance_near"])
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.7, 0.3])
+
+    fig.add_trace(go.Candlestick(
+        x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"], name="K",
+        increasing=dict(line=dict(color="#26A69A", width=1.2), fillcolor="rgba(38,166,154,0.6)"),
+        decreasing=dict(line=dict(color="#EF5350", width=1.2), fillcolor="rgba(239,83,80,0.6)")
+    ), row=1, col=1)
+
+    fig.add_trace(go.Scatter(x=df.index, y=df["SMA20"], name="SMA20", mode="lines",
+                             line=dict(width=2.2, color="#60A5FA")), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df["SMA60"], name="SMA60", mode="lines",
+                             line=dict(width=2.2, color="#F9A8D4")), row=1, col=1)
+
+    s20, s60 = df["SMA20"], df["SMA60"]
+    cross_up_idx = (s20.shift(1) <= s60.shift(1)) & (s20 > s60)
+    cross_dn_idx = (s20.shift(1) >= s60.shift(1)) & (s20 < s60)
+    fig.add_trace(go.Scatter(x=df.index[cross_up_idx], y=df.loc[cross_up_idx, "Close"], mode="markers",
+                             name="黃金交叉", marker_symbol="triangle-up", marker_size=10, marker_color="#22c55e"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index[cross_dn_idx], y=df.loc[cross_dn_idx, "Close"], mode="markers",
+                             name="死亡交叉", marker_symbol="triangle-down", marker_size=10, marker_color="#f97316"), row=1, col=1)
+
+    if feats["support_near"]:
+        fig.add_shape(type="line", x0=df.index[0], x1=df.index[-1], y0=feats["support_near"], y1=feats["support_near"],
+                      xref="x", yref="y", line=dict(dash="dot", width=1.6, color="#10b981"), row=1, col=1)
+    if feats["resistance_near"]:
+        fig.add_shape(type="line", x0=df.index[0], x1=df.index[-1], y0=feats["resistance_near"], y1=feats["resistance_near"],
+                      xref="x", yref="y", line=dict(dash="dot", width=1.6, color="#ef4444"), row=1, col=1)
+
+    fig.add_trace(go.Bar(x=df.index, y=df["Volume"], name="Volume", marker_color="rgba(100,116,139,0.7)"), row=2, col=1)
+
     if predict_enabled and forecast_steps > 0:
         try:
             base = df[["Open","High","Low","Close"]].dropna()
             fdf, med, p10, p90 = forecast_ohlc(base, steps=forecast_steps, interval=interval)
-            add_forecast_traces(fig, fdf, med, p10, p90, hist_last_index=df.index[-1])
+            purple = "#A855F7"
+            fig.add_vrect(x0=df.index[-1], x1=fdf.index[-1], fillcolor="rgba(168,85,247,0.08)", line_width=0, row=1, col=1)
+            fig.add_trace(go.Candlestick(
+                x=fdf.index, open=fdf["Open"], high=fdf["High"], low=fdf["Low"], close=fdf["Close"], name="預測K",
+                increasing=dict(line=dict(color=purple, width=1.2), fillcolor="rgba(168,85,247,0.45)"),
+                decreasing=dict(line=dict(color=purple, width=1.2), fillcolor="rgba(168,85,247,0.45)"),
+                opacity=0.85, whiskerwidth=0.3
+            ), row=1, col=1)
+            fig.add_trace(go.Scatter(x=med.index, y=p90, name="P90(收盤)", mode="lines",
+                                     line=dict(width=1.2, dash="dashdot", color=purple)), row=1, col=1)
+            fig.add_trace(go.Scatter(x=med.index, y=p10, name="P10(收盤)", mode="lines",
+                                     line=dict(width=1.2, dash="dot", color=purple),
+                                     fill="tonexty", fillcolor="rgba(168,85,247,0.12)"), row=1, col=1)
+            fig.add_trace(go.Scatter(x=med.index, y=med, name="預測收盤(中位)", mode="lines+markers",
+                                     line=dict(width=2.2, dash="dash", color=purple),
+                                     marker=dict(size=5, symbol="diamond")), row=1, col=1)
             fig.update_xaxes(range=[df.index[0], fdf.index[-1] + pd.Timedelta(days=2)])
         except Exception as e:
             st.info(f"（預測層載入失敗：{e}）")
+
+    fig.update_layout(template="plotly_dark", xaxis_rangeslider_visible=False, height=620,
+                      margin=dict(l=10, r=60, t=36, b=10),
+                      legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                      hovermode="x unified")
     st.plotly_chart(fig, use_container_width=True)
 
     # KPI
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("最新收盤", feats["close_last"])
     c2.metric("近N根漲跌幅(%)", feats["pct_change_period"])
-    c3.metric("支撐區", feats["support_near"])
-    c4.metric("壓力區", feats["resistance_near"])
+    c3.metric("支撐區(Fib 0.618)", _s(feats["support_near"]))
+    c4.metric("壓力區(Fib 0.382)", _s(feats["resistance_near"]))
 
     c5, c6, c7, c8 = st.columns(4)
     c5.metric("RSI14", _s(feats["rsi14"]))
@@ -564,81 +721,124 @@ def run_analysis(params: dict):
     c7.metric("量能基準(近30日)", f"{feats['volume_mean_period']:,}")
     c8.metric("最新量", f"{feats['volume_last']:,}")
 
-    # --- 技術輔助指標 ---
+    # === 技術輔助指標（KD / MACD） ===
     st.markdown('<a id="sec-tech"></a>', unsafe_allow_html=True)
     st.markdown("### 技術輔助指標")
     col_a, col_b = st.columns(2)
-    with col_a: st.plotly_chart(make_kd_chart(df.dropna()), use_container_width=True)
-    with col_b: st.plotly_chart(make_macd_chart(df.dropna()), use_container_width=True)
+    fig_kd = go.Figure()
+    fig_kd.add_trace(go.Scatter(x=df.index, y=df["KD_K"], mode="lines", name="%K(9)"))
+    fig_kd.add_trace(go.Scatter(x=df.index, y=df["KD_D"], mode="lines", name="%D(3)"))
+    fig_kd.add_hline(y=80, line_dash="dot"); fig_kd.add_hline(y=20, line_dash="dot")
+    fig_kd.update_layout(template="plotly_dark", height=320, margin=dict(l=10, r=10, t=10, b=10), legend=dict(orientation="h"))
+    with col_a: st.plotly_chart(fig_kd, use_container_width=True)
 
-    # --- 情報新聞摘要 ---
+    fig_macd = go.Figure()
+    fig_macd.add_trace(go.Bar(x=df.index, y=df["MACD_hist"], name="Hist"))
+    fig_macd.add_trace(go.Scatter(x=df.index, y=df["MACD"], mode="lines", name="MACD"))
+    fig_macd.add_trace(go.Scatter(x=df.index, y=df["MACD_signal"], mode="lines", name="Signal"))
+    fig_macd.update_layout(template="plotly_dark", height=320, margin=dict(l=10, r=10, t=10), legend=dict(orientation="h"))
+    with col_b: st.plotly_chart(fig_macd, use_container_width=True)
+
+    # === 黃金切割率（僅表格） ===
+    st.markdown("### 📐 黃金切割率點位（±0.382 / ±0.618，近 N 根幅度）")
+    fib_tbl = compute_fib_posneg(df, lookback)
+    if fib_tbl is not None and not fib_tbl.empty:
+        st.dataframe(fib_tbl, use_container_width=True, hide_index=True)
+    else:
+        st.info("無法計算黃金切割率（資料不足）。")
+
+    # === 二、情報新聞摘要（固定啟用） ===
     st.markdown('<a id="sec-news"></a>', unsafe_allow_html=True)
     st.markdown("## 二、情報新聞摘要")
-    results = []; agg = aggregate_sentiment([])
-    if auto_news:
-        with st.spinner("抓取新聞中…"): items = fetch_recent_news(symbol, max_news)
-        if items:
-            with st.spinner("AI 情緒分析中…"): results = classify_news_with_gemini(symbol, items, temperature)
-            agg = aggregate_sentiment(results)
-            r1, r2, r3, r4 = st.columns([2,1,1,1])
-            with r2: st.metric("新聞總篇數", agg["total"])
-            with r3: st.metric("正向比例", f'{int(agg["bullish_ratio"]*100)}%')
-            with r4: st.metric("平均相關性", agg["avg_relevance"])
-            pie_df = pd.DataFrame({"label":["正向(Bullish)","中立(Neutral)","負向(Bearish)"],
-                                   "value":[agg["bullish"],agg["neutral"],agg["bearish"]]})
-            st.plotly_chart(px.pie(pie_df, names="label", values="value", hole=0.55, title="情緒統計結果")
-                            .update_layout(template="plotly_dark", margin=dict(l=0,r=0,t=40,b=0), height=340),
-                            use_container_width=True)
-            st.markdown("### 🧾 詳細新聞列表")
-            for r in results:
-                stock_lab = r.get("stock_sentiment",{}).get("label","Neutral")
-                art_lab   = r.get("article_sentiment",{}).get("label","Neutral")
-                stock_badge = "badge-green" if stock_lab=="Bullish" else ("badge-red" if stock_lab=="Bearish" else "badge-gray")
-                art_badge   = "badge-green" if art_lab=="Positive" else ("badge-red" if art_lab=="Negative" else "badge-gray")
-                title = _s(r.get("title","(無標題)"))
-                summary_txt = to_text(r.get('summary','')).strip()
-                link_txt = to_text(r.get('link','')).strip()
-                st.markdown(f"""
+    results = []
+    items = []
+    with st.spinner("抓取新聞中…"):
+        items = fetch_news_multi(symbol, display_name, each=max_each_site)
+    if items:
+        with st.spinner("AI 情緒分析中…"):
+            results = classify_news_with_gemini(symbol, items, FIXED_TEMPERATURE)
+
+        def _agg(res):
+            if not res: return {"total":0,"bullish":0,"neutral":0,"bearish":0,"bullish_ratio":0.0,"avg_rel":0.0}
+            m = {"Bullish":0,"Neutral":0,"Bearish":0}
+            s_rel = 0.0
+            for r in res:
+                m[r.get("stock_sentiment",{}).get("label","Neutral")] += 1
+                s_rel += float(r.get("relevance",0.0) or 0.0)
+            t = len(res)
+            return {"total":t,"bullish":m["Bullish"],"neutral":m["Neutral"],"bearish":m["Bearish"],
+                    "bullish_ratio": round(m["Bullish"]/t,3), "avg_rel": round(s_rel/t,3)}
+        agg = _agg(results)
+
+        r1, r2, r3, r4 = st.columns([2,1,1,1])
+        with r2: st.metric("新聞總篇數", agg["total"])
+        with r3: st.metric("正向比例", f'{int(agg["bullish_ratio"]*100)}%')
+        with r4: st.metric("平均相關性", agg["avg_rel"])
+
+        pos = int(agg["bullish_ratio"]*100)
+        pie_df = pd.DataFrame({"label":["正向(Bullish)","中立/負向(others)"], "value":[pos, 100-pos]})
+        st.plotly_chart(px.pie(pie_df, names="label", values="value", hole=0.55, title="情緒統計結果")
+                        .update_layout(template="plotly_dark", margin=dict(l=0,r=0,t=40,b=0), height=300),
+                        use_container_width=True)
+
+        st.markdown("### 🧾 詳細新聞列表")
+        for i, r in enumerate(results):
+            meta = items[i] if i < len(items) else {}
+            src = meta.get("publisher","")
+            pub = meta.get("published_at_fmt","") or r.get("published_at","")
+            stock_lab = r.get("stock_sentiment",{}).get("label","Neutral")
+            art_lab   = r.get("article_sentiment",{}).get("label","Neutral")
+            stock_badge = "badge-green" if stock_lab=="Bullish" else ("badge-red" if stock_lab=="Bearish" else "badge-gray")
+            art_badge   = "badge-green" if art_lab=="Positive" else ("badge-red" if art_lab=="Negative" else "badge-gray")
+            title = _s(r.get("title","(無標題)"))
+            summary_txt = (_s(r.get('summary','')).strip())
+            link_txt = _s(r.get('link','')).strip()
+            link_html = f"<div style='margin-top:8px;'><a href=\"{link_txt}\" target=\"_blank\">查看原文</a></div>" if link_txt else ""
+            meta_line = f"消息來源：{src or '—'}　|　發佈時間：{pub or '—'}　|　相關性分數：{_s(r.get('relevance',0))}"
+            st.markdown(
+                f"""
 <div class="card">
+  <div class="small" style="margin:6px 0;">{meta_line}</div>
   <div style="font-weight:600">{title}</div>
-  <div class="small" style="margin:6px 0;">
-    發布時間：{_s(r.get('published_at',''))}　|　相關性分數：{_s(r.get('relevance',0))}
-  </div>
   <div style="margin:6px 0;">
     <span class="badge {stock_badge}">📈 股票情緒：{stock_lab}</span>
     <span class="badge {art_badge}">📰 文章情緒：{art_lab}</span>
   </div>
   <div style="white-space:pre-wrap; margin-top:6px;">{summary_txt}</div>
-  {"<div style='margin-top:8px;'><a href=\"%s\" target=\"_blank\">查看原文</a></div>" % link_txt if link_txt else ""}
+  {link_html}
 </div>
-""", unsafe_allow_html=True)
-        else:
-            st.info("目前抓不到新聞，已跳過情緒分析。")
+                """,
+                unsafe_allow_html=True,
+            )
     else:
-        st.info("已關閉自動抓新聞。")
+        st.info("目前抓不到新聞，已跳過情緒分析。")
 
-    # --- 三 & 四：把 AI 報告分段顯示 ---
-    st.markdown('<a id="sec-summary"></a>', unsafe_allow_html=True)
-    st.markdown("## 三、市場情緒總結")
-    with st.spinner("AI 生成『市場情緒總結』…"):
-        full_report = build_overall_report(symbol, feats, results, agg, temperature)
-        part_summary, part_ai = split_ai_report(full_report)
-    st.markdown(part_summary or "（無內容）")
-
+    # === 三：AI 報告（僅顯示「AI 分析結果」章節） ===
     st.markdown('<a id="sec-ai"></a>', unsafe_allow_html=True)
-    st.markdown("## 四、AI 分析結果")
-    st.markdown(part_ai or "（無內容）")
-
-    make_report_download(f"{symbol}_analysis.md", full_report or "")
-
+    st.markdown("## 三、AI 分析結果")
     st.caption("※ 本工具為教育用途的分析輔助，不構成投資建議。")
 
-# ====== 事件處理（已移除多餘按鈕）======
+    with st.spinner("AI 報告生成中…"):
+        full_md = build_overall_report(symbol, feats, results, FIXED_TEMPERATURE)
+        part_summary, part_ai = split_ai_report(full_md)
+
+    # 只顯示 AI 章節；若模型未輸出拆段，則顯示完整內容作為保底
+    if part_ai:
+        st.markdown(part_ai)
+    else:
+        st.markdown(re.sub(r"^##\s*[^\n]+\n?", "", (full_md or "").strip(), count=1, flags=re.M))
+
+    # 報告下載（Markdown）
+    today = dt.datetime.now().strftime("%Y%m%d")
+    report_name = f"{symbol.replace('.','_')}_report_{today}.md"
+    make_report_download(report_name, full_md)
+
+# ====== 事件處理 ======
 if run_btn:
     st.session_state.last_params = {
         "symbol": symbol, "display_name": display_name,
-        "period": period, "interval": interval, "lookback": lookback,
-        "temperature": temperature, "auto_news": auto_news, "max_news": max_news,
+        "period": DEFAULT_PERIOD, "interval": DEFAULT_INTERVAL, "lookback": DEFAULT_LOOKBACK,
+        "temperature": FIXED_TEMPERATURE, "max_each_site": max_each_site,
         "disclaimer": True, "predict_enabled": predict_enabled, "forecast_steps": forecast_steps
     }
     run_analysis(st.session_state.last_params)
